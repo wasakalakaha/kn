@@ -253,6 +253,12 @@ def days_waiting(since: str) -> int:
     return max(0, (datetime.now(timezone.utc) - d).days)
 
 
+#: Berapa dokumen per antrean yang dibaca saat menyusun daftar "paling lama menunggu".
+#: Dibaca TERURUT dari yang tertua (lihat `oldest()`), jadi batas ini memotong yang
+#: paling MUDA — bukan yang paling lama, yang justru sedang dicari.
+_OLDEST_SCAN = 200
+
+
 async def oldest(entity_id: Optional[Any] = None, limit: int = 8) -> List[Dict[str, Any]]:
     """Dokumen yang PALING LAMA menunggu keputusan, lintas semua antrean.
 
@@ -267,7 +273,21 @@ async def oldest(entity_id: Optional[Any] = None, limit: int = 8) -> List[Dict[s
         meta = AGING_META.get(key) or {"since": ["created_at"], "number": ["number"],
                                        "title": ["title"]}
         try:
-            docs = await db[coll].find({**scope, **query}, {"_id": 0}).to_list(200)
+            # DI-URUT DI BASIS DATA, bukan hanya di Python. Sebelumnya barisnya
+            # `.to_list(200)` tanpa `sort`: 200 dokumen diambil dalam URUTAN ALAMI
+            # koleksi, jadi begitu SATU antrean berisi lebih dari 200 dokumen menunggu,
+            # dokumen yang PALING LAMA bisa tidak ikut terbaca sama sekali — kartu
+            # "Paling Lama Menunggu" dan pengingat harian lalu menyebut dokumen yang
+            # SALAH tanpa satu pun galat. Ini kelas kerusakan "angka yang tenang-tenang
+            # salah", persis yang paling mahal di sini. Bukti-merahnya permanen di
+            # `test_core_f67_workflow_poc.py` (W2b, 201 dokumen muda + 1 tertua).
+            # `limit()` bukan hiasan: dengan limit, MongoDB memakai sort ber-batas-K
+            # (memori terbatas) alih-alih memuat seluruh hasil ke memori. Dokumen yang
+            # field umurnya kosong bernilai null → terbaca paling awal, dan umurnya
+            # tetap dihitung dari field cadangan di Python (`_pick`).
+            docs = await (db[coll].find({**scope, **query}, {"_id": 0})
+                          .sort([(meta["since"][0], 1)])
+                          .limit(_OLDEST_SCAN).to_list(_OLDEST_SCAN))
         except Exception:  # noqa: BLE001
             continue
         for d in docs:

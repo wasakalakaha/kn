@@ -26,6 +26,8 @@ YANG DIBUKTIKAN POC INI (lewat HTTP & MongoDB sungguhan)
 W1 Payroll `draft` **TIDAK BISA** disahkan (400 + kalimat yang menuntun ke "Ajukan").
 W2 "Ajukan" memindahkannya ke `pending_approval`, dan sejak itu ANTREAN menghitungnya
    (`/approvals/backlog` naik tepat 1 & barisnya menyebut nomor dokumennya).
+W2b Daftar "paling lama menunggu" tidak boleh MELEWATKAN yang tertua walau satu antrean
+   berisi >200 dokumen (bukti-merah: 201 dokumen muda + 1 tertua disisipkan paling akhir).
 W3 Payroll yang diajukan bisa **dikembalikan ke draf dengan ALASAN WAJIB**; alasannya
    tersimpan DI DOKUMEN (bukan cuma jejak audit) + masuk `decision_history`.
 W4 Sesudah dikembalikan, ia HILANG dari antrean (angka kembali) — antrean bukan hiasan.
@@ -155,10 +157,27 @@ def step_payroll(db, hr: httpx.Client) -> None:
        f"{q_count(before, 'hr_payroll')} → {q_count(after, 'hr_payroll')}")
     ok(total_of(after) == total_of(before) + 1, "W2 total antrean naik tepat 1",
        f"{total_of(before)} → {total_of(after)}")
+    # Daftar "paling lama menunggu" dibatasi 25 baris DAN diurut dari yang TERTUA.
+    # Dokumen yang baru diajukan justru yang paling MUDA, jadi mencarinya di daftar itu
+    # apa adanya cuma menguji "apakah backlog < 25" — bukan apa pun tentang payroll
+    # (dan itulah sebabnya pemeriksaan versi pertama memerah begitu antrean demo
+    # tumbuh jadi 27: bukan produknya yang rusak, melainkan pemeriksaannya yang salah
+    # alat ukur). Yang benar-benar perlu dibuktikan ada dua: (a) umur tunggu payroll
+    # dihitung dari KAPAN DIAJUKAN — bukan kapan drafnya dibuat, dan (b) barisnya
+    # menyebut NOMOR dokumen yang bisa dicari orang. Keduanya diuji dengan menua-kan
+    # `submitted_at` secara sengaja (`created_at` fixture tetap 2026-08-01).
+    db.hr_payroll_runs.update_one({"id": run_id},
+                                  {"$set": {"submitted_at": "2026-01-05T00:00:00+00:00"}})
     rows = backlog(hr, oldest=25).get("oldest") or []
-    ok(any("PR-POC67" in str(x.get("number", "")) for x in rows),
-       "W2 baris 'paling lama menunggu' menyebut NOMOR dokumennya",
+    row = next((x for x in rows if x.get("id") == run_id), None)
+    ok(row is not None, "W2 payroll yang diajukan MASUK daftar 'paling lama menunggu'",
        f"{len(rows)} baris tertua")
+    ok("PR-POC67" in str((row or {}).get("number", "")),
+       "W2 barisnya menyebut NOMOR dokumennya (bisa dicari orang)",
+       str((row or {}).get("number")))
+    ok(int((row or {}).get("days_waiting") or 0) >= 60,
+       "W2 umur tunggu dihitung dari KAPAN DIAJUKAN, bukan kapan draf dibuat",
+       f"{(row or {}).get('days_waiting')} hari (dari created_at hanya ~17 hari)")
 
     r = hr.post(f"/api/hr/payroll/runs/{run_id}/reject", json={"reason": ""})
     ok(r.status_code in (400, 422), "W3 tolak TANPA alasan ditolak", f"HTTP {r.status_code}")
@@ -185,6 +204,43 @@ def step_payroll(db, hr: httpx.Client) -> None:
        "W5 payroll yang DIAJUKAN bisa disahkan", f"HTTP {r.status_code}")
     ok(q_count(backlog(hr), "hr_payroll") == q_count(before, "hr_payroll"),
        "W5 sesudah disahkan ia keluar dari antrean")
+
+
+def step_oldest_scan_depth(db, hr: httpx.Client) -> None:
+    head("W2b — DAFTAR 'PALING LAMA MENUNGGU' TIDAK BOLEH MELEWATKAN YANG TERTUA")
+    # Penyusun daftar tertua membaca maksimal 200 dokumen per antrean. Kalau 200 itu
+    # diambil TANPA urutan (urutan alami koleksi), antrean yang berisi lebih dari 200
+    # dokumen membuat dokumen TERTUA tidak ikut terbaca — kartu beranda & pengingat
+    # harian lalu menyebut dokumen yang salah, tanpa satu pun galat. Bukti-merah yang
+    # bisa dijalankan: 201 dokumen MUDA disisipkan lebih dulu, yang TERTUA disisipkan
+    # PALING AKHIR (di urutan alami ia dokumen ke-202 → terpotong).
+    fillers = [{
+        "id": f"prun_poc_f67_fill{i:03d}", "number": f"KSC/PR-FILL{i:03d}",
+        "entity_id": "ent_ksc", "period": "2026-08", "status": "pending_approval",
+        "commission_mode": "none", "totals": {"gross": 0, "net": 0},
+        "submitted_at": "2026-08-18T00:00:00+00:00",
+        "created_at": "2026-08-18T00:00:00+00:00",
+    } for i in range(201)]
+    oldest_id = "prun_poc_f67_oldest"
+    try:
+        db.hr_payroll_runs.insert_many(fillers)
+        db.hr_payroll_runs.insert_one({
+            "id": oldest_id, "number": "KSC/PR-TERTUA", "entity_id": "ent_ksc",
+            "period": "2025-01", "status": "pending_approval", "commission_mode": "none",
+            "totals": {"gross": 0, "net": 0},
+            "submitted_at": "2025-01-02T00:00:00+00:00",
+            "created_at": "2025-01-02T00:00:00+00:00"})
+        top = (backlog(hr, oldest=5).get("oldest") or [{}])[0]
+        ok(top.get("id") == oldest_id,
+           "W2b dokumen TERTUA tetap di puncak walau antreannya berisi >200 dokumen",
+           f"puncak: {top.get('number')} · {top.get('days_waiting')} hari")
+        ok(int(top.get("days_waiting") or 0) >= 365,
+           "W2b umurnya utuh (bukan dokumen muda yang menyamar jadi tertua)",
+           f"{top.get('days_waiting')} hari")
+    finally:
+        db.hr_payroll_runs.delete_many({"id": {"$regex": r"^prun_poc_f67_"}})
+    left = db.hr_payroll_runs.count_documents({"id": {"$regex": r"^prun_poc_f67_"}})
+    ok(left == 0, "W2b 202 dokumen fixture dibersihkan", f"sisa {left}")
 
 
 def step_design(db, adm: httpx.Client) -> None:
@@ -345,6 +401,7 @@ def main() -> int:
         hr = adm            # admin memegang hr.manage_payroll di data demo
         fin = login("finance@kainnusantara.id", "ent_ksc")
         step_payroll(db, hr)
+        step_oldest_scan_depth(db, hr)
         step_design(db, adm)
         step_variance(db, fin)
         step_so_verify(db, adm)
@@ -357,6 +414,7 @@ def main() -> int:
                 except Exception:  # noqa: BLE001
                     pass
         db.hr_payroll_runs.delete_many({"id": "prun_poc_f67"})
+        db.hr_payroll_runs.delete_many({"id": {"$regex": r"^prun_poc_f67_"}})
         db.hr_payslips.delete_many({"run_id": "prun_poc_f67"})
         db.design_gallery.delete_many({"id": "dsgn_poc_f67"})
         db.ar_receipts.delete_many({"id": "arrc_poc_f67"})
